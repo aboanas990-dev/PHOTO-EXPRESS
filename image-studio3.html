@@ -1495,7 +1495,23 @@ function showTab(t) {
   ui('#view-' + t, { autoAlpha: 0, y: 10 }, { autoAlpha: 1, y: 0, duration: .28, clearProps: 'transform,opacity,visibility' });
   if (t === 'editor') edRender(); if (t === 'collage') drawCollage(); if (t === 'snag') { buildSnTools(); snRender(); }
 }
-const EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' };
+const EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'application/pdf': 'pdf' };
+/* Wraps a canvas in a one-page PDF (JPEG inside, page size = image size). No external library. */
+async function canvasToPdf(c, q) {
+  const jpg = new Uint8Array(await (await new Promise(r => c.toBlob(r, 'image/jpeg', q))).arrayBuffer());
+  const w = c.width, h = c.height, enc = new TextEncoder(), parts = [], offs = [];
+  let len = 0; const put = (x) => { const b = typeof x === 'string' ? enc.encode(x) : x; parts.push(b); len += b.length; };
+  const content = `q ${w} 0 0 ${h} 0 0 cm /Im0 Do Q`;
+  put('%PDF-1.4\n');
+  const obj = (n, body, stream) => { offs[n] = len; put(`${n} 0 obj\n${body}\n`); if (stream) { put('stream\n'); put(stream); put('\nendstream\n'); } put('endobj\n'); };
+  obj(1, '<< /Type /Catalog /Pages 2 0 R >>');
+  obj(2, '<< /Type /Pages /Kids [3 0 R] /Count 1 >>');
+  obj(3, `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${w} ${h}] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>`);
+  obj(4, `<< /Type /XObject /Subtype /Image /Width ${w} /Height ${h} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpg.length} >>`, jpg);
+  obj(5, `<< /Length ${content.length} >>`, content);
+  const xref = len; put(`xref\n0 6\n0000000000 65535 f \n${[1, 2, 3, 4, 5].map(n => String(offs[n]).padStart(10, '0') + ' 00000 n \n').join('')}trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`);
+  return new Blob(parts, { type: 'application/pdf' });
+}
 const fi = $('#fileInput');
 let afterImport = null;
 fi.onchange = async () => { const fs = [...fi.files]; fi.value = ''; const before = media.length; await importFiles(fs); if (afterImport) { afterImport(media.slice(before)); afterImport = null; } };
@@ -3219,7 +3235,7 @@ function exportSection(open) {
   const updInfo = () => { const k = X.maxW && D.w > X.maxW ? X.maxW / D.w : 1; info.textContent = trf$("حجم الناتج: {0}×{1} بكسل", Math.round(D.w * k), Math.round(D.h * k)) + (X.fmt === 'image/jpeg' && !D.bg ? tr$('. الشفافية تصبح بيضاء في JPG.') : ''); };
   q.addEventListener('input', () => { X.q = +q.value; }); mw.addEventListener('input', () => { X.maxW = +mw.value; updInfo(); }); updInfo();
   const s = eSec(tr$('الحفظ والتصدير'),
-    el('div', { class: 'row' }, selectEl('edFmt', [['image/png', tr$('PNG (يحفظ الشفافية)')], ['image/jpeg', 'JPG'], ['image/webp', 'WebP']], X.fmt, v => { X.fmt = v; updInfo(); }), el('label', { for: 'edMaxW', class: 'muted' }, tr$('أقصى عرض')), mw),
+    el('div', { class: 'row' }, selectEl('edFmt', [['image/png', tr$('PNG (يحفظ الشفافية)')], ['image/jpeg', 'JPG'], ['image/webp', 'WebP'], ['application/pdf', 'PDF']], X.fmt, v => { X.fmt = v; updInfo(); }), el('label', { for: 'edMaxW', class: 'muted' }, tr$('أقصى عرض')), mw),
     el('div', { class: 'field' }, el('label', { for: 'edQ' }, tr$('الجودة')), q), info,
     el('div', { class: 'btns' }, el('button', { class: 'primary', id: 'edDownload', onclick: edDownload }, tr$('تنزيل')), el('button', { id: 'edSave', onclick: edSaveLib }, tr$('حفظ في قائمة الصور'))),
     el('div', { class: 'btns' }, el('button', { id: 'edSaveProj', title: tr$('ملف يحفظ كل الطبقات لتكمل التعديل لاحقاً (Ctrl+S)'), onclick: edSaveProj }, tr$('حفظ المشروع بالطبقات')), el('button', { onclick: () => $('#edProjIn').click() }, tr$('فتح مشروع'))),
@@ -3301,12 +3317,13 @@ function edUI() { toolsState(); colorsUI(); edOptsUI(); edLayersUI(); edInspUI()
 /* ---------- export / save ---------- */
 function edBlob() {
   const X = ed.exp, D = ed.doc, k = X.maxW && D.w > X.maxW ? X.maxW / D.w : 1;
-  const c = docCanvas(k, ed.layers, D.bg, X.fmt === 'image/jpeg' && !D.bg);
+  const flat = (X.fmt === 'image/jpeg' || X.fmt === 'application/pdf') && !D.bg, c = docCanvas(k, ed.layers, D.bg, flat);
+  if (X.fmt === 'application/pdf') return canvasToPdf(c, X.q / 100).then(b => [b, X.fmt]);
   return new Promise(res => c.toBlob(b => res([b, X.fmt]), X.fmt, X.q / 100));
 }
 const edFileBase = () => asciiOr(ed.name, 'image') + '-edited';
 async function edDownload() { const [b, f] = await edBlob(); download(b, edFileBase() + '.' + EXT[f]); }
-async function edSaveLib() { const [b, f] = await edBlob(); await addMedia(b, 'image', edFileBase() + '.' + EXT[f]); toast(tr$('حُفظت نسخة في المكتبة، والتصميم بطبقاته ما زال مفتوحاً')); }
+async function edSaveLib() { if (ed.exp.fmt === 'application/pdf') { const c = docCanvas(1, ed.layers, ed.doc.bg, false); const b = await new Promise(r => c.toBlob(r, 'image/png')); await addMedia(b, 'image', edFileBase() + '.png'); toast(tr$('حُفظت نسخة في المكتبة، والتصميم بطبقاته ما زال مفتوحاً')); return; } const [b, f] = await edBlob(); await addMedia(b, 'image', edFileBase() + '.' + EXT[f]); toast(tr$('حُفظت نسخة في المكتبة، والتصميم بطبقاته ما زال مفتوحاً')); }
 async function edBatch() {
   const L = edSel(); if (!L || !(isRaster(L) || L.type === 'adjust')) { toast(tr$('حدد طبقة صورة أو طبقة تعديل فيها الألوان التي تريد تطبيقها')); return; }
   const imgs = media.filter(m => m.kind === 'image'); if (!imgs.length) return;
@@ -3314,9 +3331,9 @@ async function edBatch() {
   for (let i = 0; i < imgs.length; i++) {
     toast(trf$("معالجة {0} من {1}…", i + 1, imgs.length));
     const m = imgs[i], k = X.maxW && m.w > X.maxW ? X.maxW / m.w : 1, c = blankCv(m.w * k, m.h * k), x = c.getContext('2d');
-    if (X.fmt === 'image/jpeg') { x.fillStyle = '#fff'; x.fillRect(0, 0, c.width, c.height); }
+    if (X.fmt === 'image/jpeg' || X.fmt === 'application/pdf') { x.fillStyle = '#fff'; x.fillRect(0, 0, c.width, c.height); }
     drawRaster(x, { src: m.img, adj: L.adj, rad: 0 }, c.width, c.height, k);
-    const b = await new Promise(r => c.toBlob(r, X.fmt, X.q / 100)); download(b, asciiOr(baseName(m.name), 'image-' + (i + 1)) + '-batch.' + EXT[X.fmt]); await sleep(350);
+    const b = X.fmt === 'application/pdf' ? await canvasToPdf(c, X.q / 100) : await new Promise(r => c.toBlob(r, X.fmt, X.q / 100)); download(b, asciiOr(baseName(m.name), 'image-' + (i + 1)) + '-batch.' + EXT[X.fmt]); await sleep(350);
   }
   toast(tr$('انتهت المعالجة الدفعية: ') + imgs.length + tr$(' صورة'));
 }
